@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>DrumBum AR</title>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+
+<style>
+* { box-sizing: border-box; }
+html, body {
+  margin: 0;
+  overflow: hidden;
+  width: 100%;
+  height: 100%;
+  background: #000;
+}
+#mirrorStage {
+  position: fixed;
+  inset: 0;
+  transform: scaleX(-1);
+  z-index: 0;
+}
+#mirrorStage video,
+#mirrorStage canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+#arCanvas {
+  pointer-events: none;
+  z-index: 1;
+}
+#fingerCanvas {
+  pointer-events: none;
+  z-index: 2;
+}
+#hud {
+  position: fixed;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 2;
+  color: #fff;
+  font-family: system-ui, sans-serif;
+  margin: 0;
+  text-shadow: 0 1px 4px #000;
+}
+#hint {
+  position: fixed;
+  bottom: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 2;
+  color: rgba(255,255,255,0.75);
+  font-size: 12px;
+  font-family: system-ui, sans-serif;
+  text-align: center;
+  max-width: 90vw;
+}
+</style>
+</head>
+
+<body>
+
+<div id="hud"><h1 style="margin:0;font-size:1.5rem;"><span id="counter">0</span></h1></div>
+<p id="hint">Tap for audio · Green = index finger chain · 3D drum ray hits (mirror)</p>
+
+<div id="mirrorStage">
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="arCanvas"></canvas>
+  <canvas id="fingerCanvas"></canvas>
+</div>
+
+<script>
+const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+document.body.addEventListener("click", () => audioCtx.resume());
+
+async function loadSound(url) {
+  const r = await fetch(url);
+  const b = await r.arrayBuffer();
+  return await audioCtx.decodeAudioData(b);
+}
+
+function play(buffer, v = 1) {
+  if (!buffer) return;
+  const s = audioCtx.createBufferSource();
+  const g = audioCtx.createGain();
+  g.gain.value = v;
+  s.buffer = buffer;
+  s.connect(g);
+  g.connect(audioCtx.destination);
+  s.start(0);
+}
+
+class Drum {
+  constructor(name, file, type) {
+    this.name = name;
+    this.file = file;
+    this.type = type;
+    this.buffer = null;
+  }
+  async load() {
+    this.buffer = await loadSound(this.file);
+  }
+  hit(v) {
+    play(this.buffer, Math.min(1, 0.3 + v * 10));
+  }
+}
+
+const KIT = [
+  { name: "Hi-hat", file: "hihat.wav", type: 0,
+    pos: [-0.44, 1.14, -1.22], radius: 0.11, pitch: 0.52, roll: -0.38, yaw: 0.22, color: 0x3399ff },
+  { name: "Snare", file: "snare.wav", type: 0,
+    pos: [0.12, 1.02, -1.14], radius: 0.13, pitch: 0.62, roll: -0.18, yaw: -0.12, color: 0xff5533 },
+  { name: "Tom 1", file: "tom1.wav", type: 0,
+    pos: [-0.58, 1.28, -1.32], radius: 0.09, pitch: 0.55, roll: 0.42, yaw: 0.35, color: 0xffaa33 },
+  { name: "Tom 2", file: "tom2.wav", type: 0,
+    pos: [0.02, 1.26, -1.36], radius: 0.09, pitch: 0.48, roll: 0.08, yaw: 0.05, color: 0xffcc44 },
+  { name: "Tom 3", file: "tom3.wav", type: 0,
+    pos: [0.58, 1.22, -1.28], radius: 0.09, pitch: 0.58, roll: -0.28, yaw: -0.2, color: 0xee9922 },
+  { name: "Ride", file: "ride.wav", type: 0,
+    pos: [0.72, 1.18, -1.18], radius: 0.11, pitch: 0.42, roll: -0.45, yaw: -0.35, color: 0x88ccff },
+  { name: "Kick", file: "kick.wav", type: 1,
+    pos: [0.0, 0.42, -0.92], radius: 0.17, pitch: 1.15, roll: 0.06, yaw: 0.0, color: 0xaa44ff },
+];
+
+const drums = KIT.map((k) => new Drum(k.name, k.file, k.type));
+
+const prevFootY = [null, null];
+const prevIndexY = [null, null];
+const VELOCITY_MIN = 0.022;
+const HIT_COOLDOWN_MS = 38;
+const lastHitTimeByDrumName = Object.create(null);
+
+let counter = 0;
+
+let poseResults = null;
+let handResults = null;
+
+const pose = new Pose({
+  locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${f}`,
+});
+pose.setOptions({
+  modelComplexity: 1,
+  smoothLandmarks: true,
+  minDetectionConfidence: 0.45,
+  minTrackingConfidence: 0.45,
+});
+
+const hands = new Hands({
+  locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`,
+});
+hands.setOptions({
+  maxNumHands: 2,
+  modelComplexity: 1,
+  minDetectionConfidence: 0.45,
+  minTrackingConfidence: 0.45,
+});
+
+pose.onResults((r) => { poseResults = r; });
+hands.onResults((r) => { handResults = r; });
+
+const video = document.getElementById("video");
+const arCanvas = document.getElementById("arCanvas");
+const fingerCanvas = document.getElementById("fingerCanvas");
+const fctx = fingerCanvas.getContext("2d");
+
+/** Landmark indices: index MCP–PIP–DIP–tip */
+const INDEX_CHAIN = [5, 6, 7, 8];
+
+/** FPS: run pose every Nth camera frame (hands every frame). */
+let mpFrameIdx = 0;
+const POSE_FRAME_STRIDE = 2;
+
+const camera = new THREE.PerspectiveCamera(42, 1, 0.02, 25);
+camera.position.set(0, 1.48, 0.08);
+camera.lookAt(0, 1.05, -1.05);
+
+const scene = new THREE.Scene();
+const raycaster = new THREE.Raycaster();
+const drumRoots = [];
+
+function makeDrum3D(spec, audioDrum) {
+  const group = new THREE.Group();
+  const r = spec.radius;
+  const face = new THREE.Mesh(
+    new THREE.CircleGeometry(r, 56),
+    new THREE.MeshBasicMaterial({
+      color: spec.color,
+      side: THREE.DoubleSide,
+      transparent: true,
+      opacity: 0.82,
+      depthTest: true,
+    })
+  );
+  const rim = new THREE.Mesh(
+    new THREE.RingGeometry(r * 0.82, r, 56),
+    new THREE.MeshBasicMaterial({
+      color: 0xffffff,
+      side: THREE.DoubleSide,
+      transparent: true,
+      opacity: 0.4,
+      depthTest: true,
+    })
+  );
+  face.renderOrder = 1;
+  rim.renderOrder = 1;
+  group.add(rim);
+  group.add(face);
+  group.position.set(spec.pos[0], spec.pos[1], spec.pos[2]);
+  group.rotation.set(spec.pitch, spec.roll, spec.yaw, "XYZ");
+  group.userData.audioDrum = audioDrum;
+  group.userData.spec = spec;
+  [rim, face].forEach((m) => {
+    m.userData.audioDrum = audioDrum;
+  });
+  return group;
+}
+
+KIT.forEach((spec, i) => {
+  const g = makeDrum3D(spec, drums[i]);
+  scene.add(g);
+  drumRoots.push(g);
+});
+
+const renderer = new THREE.WebGLRenderer({
+  canvas: arCanvas,
+  alpha: true,
+  antialias: false,
+  powerPreference: "high-performance",
+});
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.25));
+renderer.setClearColor(0x000000, 0);
+
+function resize() {
+  const w = window.innerWidth;
+  const h = window.innerHeight;
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+  renderer.setSize(w, h, false);
+  fingerCanvas.width = w;
+  fingerCanvas.height = h;
+}
+window.addEventListener("resize", resize);
+resize();
+
+function drawIndexFingerOverlay() {
+  const w = fingerCanvas.width;
+  const h = fingerCanvas.height;
+  fctx.clearRect(0, 0, w, h);
+  if (!handResults?.multiHandLandmarks) return;
+
+  handResults.multiHandLandmarks.forEach((hand, hi) => {
+    fctx.strokeStyle = hi === 0 ? "rgba(0,255,160,0.95)" : "rgba(0,220,255,0.95)";
+    fctx.lineWidth = 4;
+    fctx.lineJoin = "round";
+    fctx.lineCap = "round";
+    fctx.beginPath();
+    let started = false;
+    for (let i = 0; i < INDEX_CHAIN.length; i++) {
+      const id = INDEX_CHAIN[i];
+      const p = hand[id];
+      if (!p) continue;
+      const px = p.x * w;
+      const py = p.y * h;
+      if (!started) {
+        fctx.moveTo(px, py);
+        started = true;
+      } else {
+        fctx.lineTo(px, py);
+      }
+    }
+    if (started) fctx.stroke();
+
+    const tip = hand[8];
+    if (tip) {
+      fctx.fillStyle = hi === 0 ? "rgba(0,255,160,0.95)" : "rgba(0,220,255,0.95)";
+      fctx.beginPath();
+      fctx.arc(tip.x * w, tip.y * h, 10, 0, Math.PI * 2);
+      fctx.fill();
+      fctx.strokeStyle = "rgba(0,0,0,0.5)";
+      fctx.lineWidth = 2;
+      fctx.stroke();
+    }
+  });
+}
+
+/**
+ * MediaPipe landmarks are in raw frame coords. Video + canvas are mirrored via #mirrorStage
+ * scaleX(-1), so NDC uses raw lm.x (no extra 1-x flip).
+ */
+function landmarkToNDC(lm) {
+  const x = lm.x * 2 - 1;
+  const y = -(lm.y * 2 - 1);
+  return new THREE.Vector2(x, y);
+}
+
+function resolveAudioDrumFromObject(obj) {
+  let o = obj;
+  while (o) {
+    if (o.userData && o.userData.audioDrum) return o.userData.audioDrum;
+    o = o.parent;
+  }
+  return null;
+}
+
+function tryRayHit(lm, prevStore, storeIdx, expectedType) {
+  const prev = prevStore[storeIdx] ?? lm.y;
+  const vy = lm.y - prev;
+  prevStore[storeIdx] = lm.y;
+  if (vy <= VELOCITY_MIN) return;
+
+  raycaster.setFromCamera(landmarkToNDC(lm), camera);
+  const hits = raycaster.intersectObjects(drumRoots, true);
+  if (!hits.length) return;
+
+  const ad = resolveAudioDrumFromObject(hits[0].object);
+  if (!ad || ad.type !== expectedType) return;
+
+  const now = performance.now();
+  if (now - (lastHitTimeByDrumName[ad.name] ?? 0) < HIT_COOLDOWN_MS) return;
+  lastHitTimeByDrumName[ad.name] = now;
+  ad.hit(expectedType === 1 ? 0.5 : Math.max(0.03, vy * 9));
+  counter++;
+  document.getElementById("counter").textContent = counter;
+}
+
+const cameraMP = new Camera(video, {
+  width: 640,
+  height: 480,
+  onFrame: async () => {
+    if (!video.videoWidth) return;
+    mpFrameIdx += 1;
+    try {
+      if (mpFrameIdx % POSE_FRAME_STRIDE === 0) {
+        await pose.send({ image: video });
+      }
+      await hands.send({ image: video });
+    } catch (e) {}
+  },
+});
+cameraMP.start();
+
+function frame() {
+  drawIndexFingerOverlay();
+
+  if (poseResults?.poseLandmarks) {
+    const lFoot = poseResults.poseLandmarks[31];
+    const rFoot = poseResults.poseLandmarks[32];
+    [lFoot, rFoot].forEach((limb, i) => {
+      if (!limb) return;
+      if (limb.visibility !== undefined && limb.visibility < 0.4) return;
+      tryRayHit(limb, prevFootY, i, 1);
+    });
+  }
+
+  if (handResults?.multiHandLandmarks) {
+    handResults.multiHandLandmarks.forEach((hand, hi) => {
+      const tip = hand[8];
+      if (!tip) return;
+      tryRayHit(tip, prevIndexY, hi, 0);
+    });
+  }
+
+  renderer.render(scene, camera);
+  requestAnimationFrame(frame);
+}
+
+Promise.all(drums.map((d) => d.load())).catch(() => {});
+frame();
+</script>
+
+</body>
+</html>
